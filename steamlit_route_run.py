@@ -113,7 +113,7 @@ def enhance_details(img):
 
 
 def main_loop():
-    add_bg_from_local('background_img_0.jpg')
+    # add_bg_from_local('background_img_0.jpg')
     st.title("Costmap Nodes Routes")
     st.subheader("This app will help you find the best route by using nodes on costmap.")
     st.text("select your img and points txt file")
