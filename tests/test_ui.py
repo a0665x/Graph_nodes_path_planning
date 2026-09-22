@@ -22,7 +22,17 @@ playwright = pytest.importorskip('playwright.sync_api')
 
 
 @pytest.fixture(scope='module')
-def browser_server():
+def browser_server(tmp_path_factory):
+    # Deterministic fixtures only. These do NOT represent the user's scan files.
+    root = tmp_path_factory.mktemp('ui-workspace')
+    shutil.copytree(app.ROOT / 'web', root / 'web')
+    for name, size in [('map_1.png', (120, 80)), ('map_2.png', (160, 100)),
+                       ('map_7/map_7.png', (130, 90))]:
+        path = root / 'imgs' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new('L', size, 245).save(path)
+    patch = pytest.MonkeyPatch()
+    patch.setattr(app, 'ROOT', root)
     server = app.make_server(0)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -30,6 +40,7 @@ def browser_server():
     server.shutdown()
     server.server_close()
     thread.join(timeout=3)
+    patch.undo()
 
 
 @pytest.fixture(scope='module')
@@ -43,7 +54,7 @@ def browser():
 
 
 @pytest.fixture
-def page(browser, browser_server):
+def workspace(browser, browser_server):
     context = browser.new_context(viewport={'width': 1512, 'height': 1100}, accept_downloads=True)
     page = context.new_page()
     errors = []
@@ -72,10 +83,19 @@ def page(browser, browser_server):
         page.add_script_tag(content=urlopen(browser_server + '/app.js').read().decode())
     else:
         page.goto(browser_server, wait_until='domcontentloaded')
-    page.wait_for_function("state.result !== null", timeout=30000)
+    page.wait_for_function("state.ready && state.image !== null", timeout=10000)
     yield page
     assert errors == []
     context.close()
+
+
+@pytest.fixture
+def page(workspace):
+    # Existing planner interaction tests use an explicitly selected demo.
+    # Production startup, and the tests below, must use imgs/ instead.
+    workspace.locator('#map-source').select_option('demo:mall')
+    workspace.wait_for_function("state.result !== null", timeout=30000)
+    return workspace
 
 
 def click_map(page, x, y):
@@ -201,3 +221,77 @@ def test_download_contains_real_planned_pixels(page):
     with page.expect_download() as event:
         page.locator('#export-nodes').click()
     assert '(100, 100)' in Path(event.value.path()).read_text()
+
+
+def test_startup_uses_imgs_not_synthetic_demo(workspace):
+    assert workspace.locator('#map-source').input_value() == 'repo:map_1.png'
+    assert workspace.locator('#map-title').inner_text() == 'imgs/map_1.png'
+    assert workspace.evaluate('[state.image.width, state.image.height]') == [120, 80]
+    assert workspace.evaluate('state.nodes') == []
+    assert workspace.evaluate('state.result') is None
+    options = workspace.locator('#repository-maps option').all_text_contents()
+    assert options == ['imgs/map_1.png', 'imgs/map_2.png', 'imgs/map_7/map_7.png']
+    assert workspace.locator('option[value="demo:mall"]').evaluate('(e) => e.parentElement.label') == '測試範例（非 imgs 原圖）'
+
+
+def test_switch_between_root_and_nested_original_maps(workspace):
+    for name, size in [('map_2.png', [160, 100]), ('map_7/map_7.png', [130, 90]), ('map_1.png', [120, 80])]:
+        workspace.locator('#map-source').select_option('repo:' + name)
+        workspace.wait_for_function('([w,h]) => state.ready && state.image.width === w && state.image.height === h', arg=size)
+        assert workspace.locator('#map-title').inner_text() == 'imgs/' + name
+        assert workspace.evaluate('state.nodes.length') == 0
+        assert workspace.locator('#plan').is_disabled()
+
+
+def test_reinitialization_remembers_valid_original_choice(workspace):
+    if os.environ.get('UI_HTTP_BRIDGE') == '1':
+        # about:blank bridge pages lack a storage origin. Exercise the storage
+        # adapter and reinitialization, not a claim of native reload persistence.
+        workspace.evaluate('''() => {const values = new Map();
+            Object.defineProperty(window, 'localStorage', {configurable:true,value:{
+              getItem:k => values.get(k) ?? null,
+              setItem:(k,v) => values.set(k,String(v))}});
+        }''')
+    workspace.locator('#map-source').select_option('repo:map_7/map_7.png')
+    workspace.wait_for_function("state.ready && rememberedMap() === 'repo:map_7/map_7.png'")
+    workspace.evaluate('initializeMaps()')
+    assert workspace.locator('#map-source').input_value() == 'repo:map_7/map_7.png'
+    assert workspace.evaluate('state.image.width') == 130
+    workspace.evaluate("rememberMap('repo:deleted.png')")
+    workspace.evaluate('initializeMaps()')
+    assert workspace.locator('#map-source').input_value() == 'repo:map_1.png'
+
+
+def test_empty_imgs_stays_empty_without_automatic_demo(workspace):
+    workspace.evaluate('''async() => {
+      const previous = window.fetch; window.demoCalls = 0;
+      window.fetch = (path, options) => {
+        if (path.startsWith('/api/demo')) window.demoCalls++;
+        if (path === '/api/maps') return Promise.resolve(new Response(JSON.stringify({maps:[]}), {status:200}));
+        return previous(path, options);
+      };
+      await initializeMaps();
+    }''')
+    assert workspace.locator('#map-source').input_value() == ''
+    assert workspace.evaluate('state.image') is None
+    assert workspace.evaluate('window.demoCalls') == 0
+    assert workspace.locator('#plan').is_disabled()
+    assert '不會自動替換為範例圖' in workspace.locator('#message').inner_text()
+
+
+def test_failed_original_load_never_displays_previous_or_demo_map(workspace):
+    workspace.evaluate('''() => {
+      const previous = window.fetch; window.demoCalls = 0;
+      window.fetch = (path, options) => {
+        if (path.startsWith('/api/demo')) window.demoCalls++;
+        if (path === '/api/map?name=map_2.png') return Promise.resolve(new Response(JSON.stringify({error:'Unreadable original map'}), {status:400}));
+        return previous(path, options);
+      };
+    }''')
+    workspace.locator('#map-source').select_option('repo:map_2.png')
+    workspace.wait_for_function("document.querySelector('#message').textContent.includes('Unreadable original map')")
+    assert workspace.locator('#map-source').input_value() == 'repo:map_2.png'
+    assert workspace.locator('#map-title').inner_text() == 'imgs/map_2.png'
+    assert workspace.evaluate('state.image') is None
+    assert workspace.evaluate('window.demoCalls') == 0
+    assert workspace.locator('#plan').is_disabled()

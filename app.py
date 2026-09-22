@@ -105,6 +105,29 @@ def build_map(payload: dict) -> Costmap:
     return Costmap(decode_image(payload.get("image", "")), settings)
 
 
+def repository_maps() -> dict[str, Path]:
+    """Read-only catalog of original imgs/ images, including subdirectories.
+
+    Relative paths are the identifiers: repeated basenames remain distinct.
+    Resolve the allowlist before accepting a request; never join an arbitrary
+    user-supplied path or expose symlinks escaping the image directory.
+    """
+    directory = (ROOT / "imgs").resolve()
+    images = {}
+    for path in directory.rglob("*"):
+        if (path.is_file() and not path.is_symlink()
+                and path.suffix.lower() in (".png", ".jpg", ".jpeg", ".pgm")
+                and path.resolve().is_relative_to(directory)):
+            images[path.relative_to(directory).as_posix()] = path
+
+    def order(name):
+        natural = tuple((0, int(part)) if part.isdigit() else (1, part.casefold())
+                        for part in re.split(r"(\d+)", name))
+        return name.count("/"), natural
+
+    return {name: images[name] for name in sorted(images, key=order)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RouteStudio/1.0"
 
@@ -136,17 +159,14 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/health":
             return self.reply({"status": "ok"})
         if url.path == "/api/maps":
-            maps = sorted(p.name for p in (ROOT / "imgs").glob("*")
-                          if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".pgm"))
-            return self.reply({"maps": maps})
+            return self.reply({"maps": list(repository_maps())})
         if url.path in ("/api/demo", "/api/map"):
             try:
                 if url.path == "/api/demo":
                     image, nodes = demo_map(query.get("name", ["mall"])[0])
                 else:
                     name = query.get("name", [""])[0]
-                    maps = {p.name: p for p in (ROOT / "imgs").glob("*")
-                            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".pgm")}
+                    maps = repository_maps()
                     if name not in maps:
                         return self.reply({"error": "Map not found."}, 404)
                     image = decode_image(base64.b64encode(maps[name].read_bytes()).decode("ascii"))

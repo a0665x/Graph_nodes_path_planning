@@ -141,3 +141,59 @@ def test_no_process_working_directory_dependency(server, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert request(server, '/')[0] == 200
     assert request(server, '/api/health')[0] == 200
+
+
+def test_catalog_includes_nested_originals_without_basename_collisions(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, 'ROOT', tmp_path)
+    images = tmp_path / 'imgs'
+    for name, size, value in [('map_1.png', (40, 30), 235), ('map_2.png', (50, 35), 240),
+                              ('map_10.jpg', (60, 40), 245), ('map_7/map_7.png', (70, 45), 250),
+                              ('map_1/map_1.png', (80, 50), 255)]:
+        path = images / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new('L', size, value).save(path)
+    before = {p.relative_to(images).as_posix(): p.read_bytes() for p in images.rglob('*') if p.is_file()}
+    code, body, _ = request(server, '/api/maps')
+    assert code == 200
+    assert json.loads(body)['maps'] == ['map_1.png', 'map_2.png', 'map_10.jpg',
+                                        'map_1/map_1.png', 'map_7/map_7.png']
+    for name, size in [('map_1.png', (40, 30)), ('map_1/map_1.png', (80, 50)), ('map_7/map_7.png', (70, 45))]:
+        from urllib.parse import quote
+        code, body, _ = request(server, '/api/map?name=' + quote(name, safe=''))
+        result = json.loads(body)
+        assert code == 200
+        assert (result['width'], result['height']) == size
+        assert result['nodes'] == []  # No synthetic demo waypoints on an original map.
+        original = np.array(Image.open(images / name).convert('L'))
+        assert np.array_equal(app.decode_image(result['image']), original)
+    after = {p.relative_to(images).as_posix(): p.read_bytes() for p in images.rglob('*') if p.is_file()}
+    assert after == before  # Catalog and loading never write to imgs/.
+
+
+def test_recursive_catalog_does_not_expose_external_symlinks(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, 'ROOT', tmp_path)
+    images = tmp_path / 'imgs'
+    images.mkdir()
+    outside = tmp_path / 'private.png'
+    Image.new('L', (20, 20), 255).save(outside)
+    (images / 'leaked.png').symlink_to(outside)
+    code, body, _ = request(server, '/api/maps')
+    assert code == 200 and json.loads(body)['maps'] == []
+    for name in ['leaked.png', '..%2Fprivate.png', '%2Fprivate.png']:
+        assert request(server, '/api/map?name=' + name)[0] == 404
+
+
+def test_missing_image_directory_does_not_substitute_demos(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, 'ROOT', tmp_path)
+    code, body, _ = request(server, '/api/maps')
+    assert code == 200 and json.loads(body)['maps'] == []
+    code, body, _ = request(server, '/api/map?name=map_1.png')
+    assert code == 404 and 'image' not in json.loads(body)
+
+
+def test_invalid_original_image_is_not_silently_replaced(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(app, 'ROOT', tmp_path)
+    (tmp_path / 'imgs').mkdir()
+    (tmp_path / 'imgs' / 'broken.png').write_bytes(b'not an image')
+    code, body, _ = request(server, '/api/map?name=broken.png')
+    assert code == 400 and 'image' not in json.loads(body)

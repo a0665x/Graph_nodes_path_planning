@@ -4,6 +4,17 @@ const state = {image: null, source: "", mask: null, overlay: null, nodes: [], re
   mode: "via", revision: 0, mapRevision: 0, ready: false, busy: false, upload: null, zoom: 1, panX: 0, panY: 0};
 const canvas = $("map"), context = canvas.getContext("2d");
 let settingsTimer;
+const MAP_PREFERENCE_KEY = "route-studio:selected-repo-map";
+function rememberedMap() {
+  try { return localStorage.getItem(MAP_PREFERENCE_KEY); }
+  catch (_) { return null; } // Storage may be disabled; choosing a map still works.
+}
+function rememberMap(value) {
+  // Synthetic demos and temporary uploads must not replace the original-map default.
+  if (!value.startsWith("repo:")) return;
+  try { localStorage.setItem(MAP_PREFERENCE_KEY, value); }
+  catch (_) { /* A privacy setting must not prevent map loading. */ }
+}
 
 async function api(path, payload) {
   const response = await fetch(path, payload === undefined ? {} : {
@@ -153,8 +164,10 @@ async function setMap(encoded, nodes, title) {
     if (await prepare()) {
       message("地圖就緒。請在白色走廊放置節點；滾輪可縮放，右鍵可拖曳。", "pending");
       if (nodes.length >= 2) await plan();
+      return true;
     }
   } catch (error) { if (revision === state.revision) { $("empty-map").hidden = true; message(error.message, "error"); } }
+  return false;
 }
 async function plan() {
   if (!state.ready || state.busy || state.nodes.length < 2) return;
@@ -183,18 +196,52 @@ async function plan() {
   } finally { if (revision === state.revision) { state.busy = false; updateButtons(); } }
 }
 let loadSequence = 0;
+function clearMapView(title) {
+  clearTimeout(settingsTimer); state.mapRevision++; state.ready = false;
+  state.source = ""; state.image = null; state.mask = null; state.overlay = null; state.nodes = [];
+  state.zoom = 1; state.panX = state.panY = 0;
+  $("map-title").textContent = title; $("map-dimensions").textContent = "—";
+  $("canvas-state").textContent = "尚未載入地圖";
+  invalidate("載入地圖中…"); renderNodes();
+}
 async function selectMap() {
   const sequence = ++loadSequence;
-  state.mapRevision++; state.ready = false; invalidate("載入地圖中…");
-  const value = $("map-source").value, title = $("map-source").selectedOptions[0].textContent;
+  const value = $("map-source").value, title = $("map-source").selectedOptions[0]?.textContent || "選擇 imgs/ 原始地圖";
+  clearMapView(title);
+  if (!value) {
+    $("empty-map").hidden = false; $("empty-map").textContent = "請選擇或匯入你的原始 Costmap";
+    message("imgs/ 內尚無可用圖片。請加入原始地圖後重新整理，或使用「匯入 Costmap」。不會自動替換為範例圖。", "pending");
+    return;
+  }
+  $("empty-map").textContent = "載入地圖中…"; $("empty-map").hidden = false;
   try {
     if (value === "upload" && state.upload) {
       await setMap(state.upload.image, [], state.upload.name); return;
     }
     const url = value.startsWith("demo:") ? `/api/demo?name=${encodeURIComponent(value.slice(5))}` : `/api/map?name=${encodeURIComponent(value.slice(5))}`;
     const result = await api(url);
-    if (sequence === loadSequence) await setMap(result.image, result.nodes, title);
-  } catch (error) { if (sequence === loadSequence) message(error.message, "error"); }
+    if (sequence === loadSequence) {
+      const loaded = await setMap(result.image, result.nodes, title);
+      if (loaded && sequence === loadSequence) rememberMap(value);
+    }
+  } catch (error) {
+    if (sequence === loadSequence) {
+      $("empty-map").hidden = true;
+      message(`無法載入所選地圖：${error.message}。請重新選擇，不會替換為範例圖。`, "error");
+    }
+  }
+}
+async function initializeMaps() {
+  const result = await api("/api/maps");
+  const group = $("repository-maps"); group.replaceChildren();
+  for (const name of result.maps) group.append(new Option(`imgs/${name}`, `repo:${name}`));
+  const saved = rememberedMap();
+  const choices = result.maps.map(name => `repo:${name}`);
+  // A clean start uses an ORIGINAL repository image, never the synthetic demos.
+  $("map-source").value = choices.includes(saved) ? saved
+    : choices.includes("repo:map_1.png") ? "repo:map_1.png" : choices[0] || "";
+  $("map-source").querySelector('option[value=""]').textContent = result.maps.length ? "選擇原始地圖" : "imgs/ 尚無可用地圖";
+  await selectMap();
 }
 function imagePoint(event) {
   const rect = canvas.getBoundingClientRect(), t = transform();
@@ -304,10 +351,4 @@ $("export-route").onclick = () => {
   if (state.result) download("safe-route.json", JSON.stringify({map: $("map-title").textContent,
     image_width: state.image.width, image_height: state.image.height, ...state.result}, null, 2), "application/json");
 };
-(async () => {
-  try {
-    const result = await api("/api/maps");
-    for (const name of result.maps) $("map-source").add(new Option(name, `repo:${name}`));
-    await selectMap();
-  } catch (error) { message(error.message, "error"); }
-})();
+initializeMaps().catch(error => message(error.message, "error"));
